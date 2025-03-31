@@ -94,13 +94,13 @@ def main():
         description="Find the commit most similar to an offline repo snapshot."
     )
     parser.add_argument(
-        "--online",
+        "--git",
         required=True,
         help="Path to the tracked Git repository",
         dest="git_repo_path",
     )
     parser.add_argument(
-        "--offline",
+        "--non-git",
         required=True,
         help="Path to the untracked/modified copy (doesn't require/use .git folder)",
         dest="non_git_folder_path",
