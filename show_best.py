@@ -1,5 +1,4 @@
 import polars as pl
-from pathlib import Path
 
 print("Higher score means closer match.")
 
