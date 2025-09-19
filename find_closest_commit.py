@@ -50,7 +50,10 @@ def get_all_commits(repo: git.Repo) -> list[git.Commit]:
 
 
 def find_most_similar_commit(
-    git_repo_path: Path, non_git_folder_path: Path
+    git_repo_path: Path,
+    non_git_folder_path: Path,
+    *,
+    jsonl_output_path: Path | None = None,
 ) -> tuple[str | None, int]:
     assert (git_repo_path / ".git").exists(), (
         "The online repo must be a valid git repository."
@@ -102,8 +105,9 @@ def find_most_similar_commit(
 
             data_row_json: str = json.dumps(data_row, ensure_ascii=False)
             logger.info(data_row_json)
-            with open("commit_scores.jsonl", "a") as f:
-                f.write(data_row_json + "\n")
+            if jsonl_output_path:
+                with open(jsonl_output_path, "a") as f:
+                    f.write(data_row_json + "\n")
 
     try:
         repo.git.checkout(current_checkout)
@@ -129,11 +133,20 @@ def main():
         help="Path to the untracked/modified copy (doesn't require/use .git folder)",
         dest="non_git_folder_path",
     )
+    parser.add_argument(
+        "--jsonl-output", "--jsonl",
+        help="Path to output JSONL file",
+        default=None,
+        dest="jsonl_output_path",
+    )
     args = parser.parse_args()
 
     commit, score = find_most_similar_commit(
         git_repo_path=Path(args.git_repo_path),
         non_git_folder_path=Path(args.non_git_folder_path),
+        jsonl_output_path=Path(args.jsonl_output_path)
+        if args.jsonl_output_path
+        else None,
     )
     if commit:
         logger.success(f"Most similar commit: {commit} with score {score}")
