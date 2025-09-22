@@ -14,7 +14,7 @@ use walkdir::WalkDir;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "commit-similarity-search",
+    name = "find_closest_git_commit",
     about = "Find the commit most similar to an offline repo snapshot."
 )]
 struct Args {
@@ -131,18 +131,38 @@ fn main() -> Result<()> {
 }
 
 /// Calculate SHA256 hash of a file (read in 1 MiB chunks).
-fn file_hash(path: &Path) -> Result<String> {
-    let mut h = Sha256::new();
-    let mut f = File::open(path)?;
-    let mut buf = vec![0u8; 1 << 20];
+fn file_hash_ignoring_whitespaces(path: &Path) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut fp = File::open(path)?;
+    let mut buf = [0u8; 1 << 20];
+
+    // Tracks whether the *last emitted byte* was a whitespace (so runs collapse across chunk edges).
+    let mut prev_was_ws = false;
+
     loop {
-        let n = f.read(&mut buf)?;
+        let n = fp.read(&mut buf)?;
         if n == 0 {
             break;
         }
-        h.update(&buf[..n]);
+
+        for &byte in &buf[..n] {
+            // Step 1: replace '\r' with space.
+            let b: u8 = if byte == b'\r' { b' ' } else { byte };
+
+            // Step 2: Collapse consecutive ASCII whitespaces to a single space.
+            if b.is_ascii_whitespace() {
+                if !prev_was_ws {
+                    hasher.update(&[b' ']);
+                    prev_was_ws = true;
+                }
+            } else {
+                hasher.update(&[b]);
+                prev_was_ws = false;
+            }
+        }
     }
-    Ok(format!("{:x}", h.finalize()))
+
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Collect file hashes for a directory tree, skipping anything with ".git" in its path components.
@@ -160,7 +180,7 @@ fn collect_file_hashes(base_dir: &Path) -> Result<BTreeMap<String, String>> {
             }
             let rel = pathdiff::diff_paths(path, base_dir).unwrap_or_else(|| path.to_path_buf());
             let relp = rel.to_string_lossy().replace('\\', "/");
-            let h = file_hash(path)?;
+            let h = file_hash_ignoring_whitespaces(path)?;
             hashes.insert(relp, h);
         }
     }
@@ -313,10 +333,7 @@ fn find_most_similar_commit(
     unchanged_files_hint_list: Option<&[String]>,
 ) -> Result<(Option<String>, i64)> {
     let master_ref = resolve_master_like_ref(repo)?;
-    log::info!(
-        "Using \"{}\" as the master-like lineage root.",
-        master_ref
-    );
+    log::info!("Using \"{}\" as the master-like lineage root.", master_ref);
 
     // Prepare offline hashes.
     let hashes_offline = collect_file_hashes(&non_git_folder_path)?;
