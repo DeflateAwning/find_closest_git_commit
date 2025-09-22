@@ -20,8 +20,11 @@ import git
 def file_hash(path: Path) -> str:
     h = hashlib.sha1()
     with open(path, "rb") as f:
-        while chunk := f.read(8192):
+        while chunk := f.read(2**20): # Read in 1 MiB chunks.
+            # chunk_cleaned = re.sub(rb"[\s\r]+", b" ", chunk)
+            # chunk_cleaned = chunk_cleaned.strip()
             h.update(chunk)
+
     return h.hexdigest()
 
 
@@ -81,6 +84,45 @@ def get_filtered_commits(
     return commits
 
 
+def _resolve_master_like_ref(repo: git.Repo) -> str | None:
+    """
+    Return the best ref to use as the 'master' lineage root.
+    Tries local then remote-tracking branches in a sensible order.
+    """
+    candidates = ["master", "main", "origin/master", "origin/main"]
+    for ref in candidates:
+        try:
+            repo.commit(ref)  # will raise if ref doesn't exist
+            return ref
+        except Exception:
+            continue
+    return None
+
+
+def is_commit_in_master_lineage(
+    repo: git.Repo,
+    commit: git.Commit | str,
+    *,
+    master_ref: str | None = None,
+) -> bool:
+    """True if `commit` is an ancestor of `master_ref`.
+
+    `master_ref` defaults to a 'master-like' ref such as 'master', 'main', 'origin/master', or 'origin/main').
+    """
+    commit_sha = commit.hexsha if isinstance(commit, git.Commit) else str(commit)
+    target_ref = master_ref or _resolve_master_like_ref(repo)
+    if not target_ref:
+        # No suitable master-like ref found; be explicit that we can't determine lineage.
+        raise ValueError("No suitable master-like ref found in the repo.")
+
+    # `merge-base --is-ancestor A B` exits 0 if A is ancestor of B; non-zero otherwise.
+    try:
+        repo.git.merge_base("--is-ancestor", commit_sha, target_ref)
+        return True
+    except git.GitCommandError:
+        return False
+
+
 def find_most_similar_commit(
     git_repo_path: Path,
     non_git_folder_path: Path,
@@ -96,6 +138,9 @@ def find_most_similar_commit(
 
     best_score = -1_000_000_000
     best_commit = None
+
+    master_ref = _resolve_master_like_ref(repo)
+    logger.info(f'Using "{master_ref}" as the master-like lineage root.')
 
     with tempfile.TemporaryDirectory() as offline_temp_str:
         offline_temp_path = Path(offline_temp_str)
@@ -124,13 +169,15 @@ def find_most_similar_commit(
                 "commit_hash": commit_sha,
                 "datetime": commit_time,
                 "score": score,
+                "in_master_lineage": is_commit_in_master_lineage(repo, commit, master_ref=master_ref),
             } | comparison
 
             if unchanged_files_hint_list:
                 data_row["matched_hint_files"] = sum(
                     1
                     for f in unchanged_files_hint_list
-                    if hashes_git.get(f, "GIT_HASH_NOT_EXIST") == hashes_offline.get(f, "OFFLINE_HASH_NOT_EXIST")
+                    if hashes_git.get(f, "GIT_HASH_NOT_EXIST")
+                    == hashes_offline.get(f, "OFFLINE_HASH_NOT_EXIST")
                 )
 
             if score > best_score:
