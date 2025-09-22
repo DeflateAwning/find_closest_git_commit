@@ -249,22 +249,23 @@ fn get_filtered_commits(
 }
 
 fn parse_iso_to_unix(s: &str) -> Result<i64> {
-    // Try yyyy-mm-dd first (assume midnight UTC)
+    use chrono::TimeZone;
+
+    // Try yyyy-mm-dd first (assume midnight UTC).
     if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        let dt = chrono::DateTime::<chrono::Utc>::from_utc(
-            d.and_hms_opt(0, 0, 0)
+        let dt = chrono::Utc.from_utc_datetime(
+            &d.and_hms_opt(0, 0, 0)
                 .ok_or_else(|| anyhow!("Invalid time"))?,
-            chrono::Utc,
         );
         return Ok(dt.timestamp());
     }
 
-    // Try RFC3339 first
+    // Try RFC3339.
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
         return Ok(dt.timestamp());
     }
 
-    // Try a looser parser (e.g., "2024-01-01T00:00:00")
+    // Try a looser parser (e.g., "2024-01-01T00:00:00").
     if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
         let dt = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc);
         return Ok(dt.timestamp());
