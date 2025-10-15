@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use env_logger::Env;
-use git2::{Oid, Repository, Time};
+use git2::{Oid, Repository, SubmoduleUpdateOptions, Time};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -41,6 +41,10 @@ struct Args {
     /// Path to a text file with files expected to match in closest commit (one per line)
     #[arg(long = "unchanged-files-hint-list")]
     unchanged_files_hint_list_path: Option<PathBuf>,
+
+    /// Name of the main branch (default: auto-detect master/main).
+    #[arg(long = "main-branch")]
+    main_branch: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -116,6 +120,7 @@ fn main() -> Result<()> {
         args.jsonl_output_path.as_deref(),
         &commits,
         hint_list.as_deref(),
+        args.main_branch.as_deref(),
     )?;
 
     match best_commit {
@@ -152,11 +157,11 @@ fn file_hash_ignoring_whitespaces(path: &Path) -> Result<String> {
             // Step 2: Collapse consecutive ASCII whitespaces to a single space.
             if b.is_ascii_whitespace() {
                 if !prev_was_ws {
-                    hasher.update(&[b' ']);
+                    hasher.update(b" ");
                     prev_was_ws = true;
                 }
             } else {
-                hasher.update(&[b]);
+                hasher.update([b]);
                 prev_was_ws = false;
             }
         }
@@ -293,16 +298,20 @@ fn parse_iso_to_unix(s: &str) -> Result<i64> {
     bail!("Unrecognized ISO-8601 format: {s}")
 }
 
-/// Resolve a “master-like” ref, specific to the repository.
-fn resolve_master_like_ref(repo: &Repository) -> Result<String> {
-    let candidates = [
-        "refs/heads/master",
-        "refs/heads/main",
-        "refs/remotes/origin/master",
-        "refs/remotes/origin/main",
+/// Resolve a "master-like" ref, specific to the repository.
+fn resolve_master_like_ref(repo: &Repository, main_branch_hint: Option<&str>) -> Result<String> {
+    let mut candidates: Vec<String> = vec![
+        "refs/heads/master".to_string(),
+        "refs/heads/main".to_string(),
+        "refs/remotes/origin/master".to_string(),
+        "refs/remotes/origin/main".to_string(),
     ];
+    if let Some(hint) = main_branch_hint {
+        // Insert at the front to prioritize.
+        candidates.insert(0, format!("refs/heads/{}", hint));
+    }
     for name in candidates {
-        if repo.refname_to_id(name).is_ok() {
+        if repo.refname_to_id(&name).is_ok() {
             return Ok(name.to_string());
         }
     }
@@ -312,15 +321,65 @@ fn resolve_master_like_ref(repo: &Repository) -> Result<String> {
 /// True if `commit` is an ancestor of `master_ref` (master/main line).
 fn is_commit_in_master_lineage(repo: &Repository, commit: Oid, master_ref: &str) -> Result<bool> {
     let head_oid = repo.refname_to_id(master_ref)?;
-    // “A is ancestor of B” ≈ graph_descendant_of(B, A)
+    // "A is ancestor of B" ≈ graph_descendant_of(B, A)
     Ok(repo.graph_descendant_of(head_oid, commit).unwrap_or(false))
 }
 
+/// Update all submodules recursively.
+/// Equivalent to: git submodule update --init --recursive
+fn update_submodules_recursive(repo: &Repository) -> Result<()> {
+    let mut update_opts = SubmoduleUpdateOptions::new();
+
+    // Get all submodules
+    let submodule_names: Vec<String> = repo
+        .submodules()?
+        .iter()
+        .filter_map(|s| s.name().map(String::from))
+        .collect();
+
+    if submodule_names.is_empty() {
+        return Ok(());
+    }
+
+    log::debug!("Found {} submodule(s) to update", submodule_names.len());
+
+    for name in submodule_names {
+        let mut submodule = repo.find_submodule(&name)?;
+
+        // Initialize if not already initialized.
+        let needs_init = match submodule.open() {
+            Err(_) => true, // Failed to open
+            Ok(repo) => repo.is_empty().unwrap_or(true) || submodule.workdir_id().is_none(),
+        };
+        if needs_init {
+            log::info!("Initializing submodule: {}", submodule.path().display());
+            submodule.init(false)?;
+        }
+
+        // Update the submodule.
+        submodule.update(true, Some(&mut update_opts))?;
+
+        // Recursively update nested submodules.
+        if let Ok(sub_repo) = submodule.open() {
+            update_submodules_recursive(&sub_repo)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Check out a commit in detached HEAD mode.
+/// Also, ensure submodules are checked out correctly.
 fn check_out_commit(repo: &Repository, commit_oid: Oid) -> Result<()> {
     let commit = repo.find_commit(commit_oid)?;
     let tree = commit.tree()?;
-    repo.checkout_tree(&tree.as_object(), None)?;
+    repo.checkout_tree(tree.as_object(), None)?;
     repo.set_head_detached(commit_oid)?;
+
+    // Update submodules after checkout.
+    log::debug!("Updating submodules for commit {}", commit_oid);
+    update_submodules_recursive(repo)?;
+
     Ok(())
 }
 
@@ -331,12 +390,13 @@ fn find_most_similar_commit(
     jsonl_output_path: Option<&Path>,
     commits: &[Oid],
     unchanged_files_hint_list: Option<&[String]>,
+    main_branch_hint: Option<&str>,
 ) -> Result<(Option<String>, i64)> {
-    let master_ref = resolve_master_like_ref(repo)?;
+    let master_ref = resolve_master_like_ref(repo, main_branch_hint)?;
     log::info!("Using \"{}\" as the master-like lineage root.", master_ref);
 
     // Prepare offline hashes.
-    let hashes_offline = collect_file_hashes(&non_git_folder_path)?;
+    let hashes_offline = collect_file_hashes(non_git_folder_path)?;
 
     let mut best_score: i64 = i64::MIN;
     let mut best_commit: Option<String> = None;
@@ -357,7 +417,15 @@ fn find_most_similar_commit(
         let commit_time = time_to_iso8601(c.time());
 
         // Check out the commit (detached HEAD).
-        check_out_commit(repo, commit_oid)?;
+        // On error, ignore and continue.
+        if let Err(e) = check_out_commit(repo, commit_oid) {
+            log::warn!(
+                "Skipping commit {} due to checkout error: {}",
+                commit_hash,
+                e
+            );
+            continue;
+        }
 
         let hashes_git = collect_file_hashes(git_repo_path)?;
         let (matches, mismatches, one_sided_files, total_matched_hashes) =
